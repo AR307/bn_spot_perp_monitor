@@ -1,0 +1,13 @@
+# Python 编译缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.env/
+.env
+*.env
+
+# IDE 设置
+.vscode/
+.idea/
