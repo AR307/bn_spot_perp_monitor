@@ -20,7 +20,21 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.03"))  # 3%
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 WINDOW_MINUTES = int(os.getenv("WINDOW_MINUTES", "15"))
-ALERT_COOLDOWN_SECONDS = WINDOW_MINUTES * 60  # 同一币种至少间隔一个窗口再提醒
+
+# 新增：同一个币种+方向的最小提醒间隔（秒），默认 60 秒
+ALERT_MIN_INTERVAL_SECONDS = int(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "60"))
+# 新增：记录 alert key 的最后提醒时间（key = "BASE:UP" / "BASE:DOWN"）
+last_alert_key_time = {}
+
+# 30 分钟无消息则重置次数（可在 .env 里改 ALERT_RESET_SECONDS）
+ALERT_RESET_SECONDS = int(os.getenv("ALERT_RESET_SECONDS", "1800"))
+
+# 记录每个 base 币种的涨/跌告警次数与时间
+# 结构：base -> {"last_dir": "UP"/"DOWN"/None,
+#                "up_count": int, "down_count": int,
+#                "last_up_ts": float, "last_down_ts": float}
+alert_streak_state = {}
+
 
 # 新增：配置需要屏蔽的币种（base asset），默认屏蔽 BTTC
 # 例子：BLACKLIST_BASES=BTTC,PEPE,1000BONK
@@ -360,15 +374,42 @@ def generate_1m_candlestick_png(symbol: str, market: str, limit: int = 120):
         logging.warning("生成 %s 1m K 线图失败: %s", symbol, e)
         return None
 
+def update_alert_streak(base_asset: str, direction_flag: str, now_ts: float) -> int:
+    """
+    更新某个 base 币种在某个方向上的告警次数，并返回当前是第几次告警。
+    direction_flag: "UP" 或 "DOWN"
+    """
+    state = alert_streak_state.get(base_asset, {
+        "last_dir": None,
+        "up_count": 0,
+        "down_count": 0,
+        "last_up_ts": 0.0,
+        "last_down_ts": 0.0,
+    })
 
-#send 1m photo to a symbol
-def send_symbol_1m_chart(symbol: str, market: str):
-    """
-    生成并发送某个 symbol 的 1 分钟 K 线截图
-    """
-    png_bytes = generate_1m_candlestick_png(symbol, market, limit=120)
-    if png_bytes:
-        send_telegram_photo(png_bytes)
+    if direction_flag == "UP":
+        last_ts = state.get("last_up_ts", 0.0)
+        # 方向改变 或 距离上次上涨告警超过 ALERT_RESET_SECONDS -> 重置为第一次
+        if state.get("last_dir") != "UP" or now_ts - last_ts > ALERT_RESET_SECONDS:
+            state["up_count"] = 1
+        else:
+            state["up_count"] = state.get("up_count", 0) + 1
+        state["last_up_ts"] = now_ts
+        state["last_dir"] = "UP"
+        count = state["up_count"]
+    else:  # DOWN
+        last_ts = state.get("last_down_ts", 0.0)
+        if state.get("last_dir") != "DOWN" or now_ts - last_ts > ALERT_RESET_SECONDS:
+            state["down_count"] = 1
+        else:
+            state["down_count"] = state.get("down_count", 0) + 1
+        state["last_down_ts"] = now_ts
+        state["last_dir"] = "DOWN"
+        count = state["down_count"]
+
+    alert_streak_state[base_asset] = state
+    return count
+
 
 # ================== 监控 & 告警逻辑 ==================
 
@@ -413,12 +454,19 @@ def update_and_check_market(market: str, tickers: list):
         if abs(change_pct) < PRICE_CHANGE_THRESHOLD:
             continue
 
-        # 冷却时间，避免频繁提醒
-        last_ts = last_alert_time[market].get(symbol, 0)
-        if now_ts - last_ts < ALERT_COOLDOWN_SECONDS:
+        # ========= 新增：同一个「币种 + 方向」在全局至少间隔 ALERT_MIN_INTERVAL_SECONDS 秒 =========
+        direction_flag = "UP" if change_pct > 0 else "DOWN"
+        # 这里用 base_asset 去重，这样现货 / U 本位 / 币本位不会重复轰炸
+        alert_key = f"{base_asset}:{direction_flag}"
+        last_ts_key = last_alert_key_time.get(alert_key, 0)
+        if now_ts - last_ts_key < ALERT_MIN_INTERVAL_SECONDS:
+            # 同一币种 + 同一方向，时间间隔太短，直接跳过
             continue
+        last_alert_key_time[alert_key] = now_ts
+        # =========================================================================
+        # 计算这是该币种在该方向上的第几次告警（带 30min 自动重置 & 方向切换重置）
+        alert_count = update_alert_streak(base_asset, direction_flag, now_ts)
 
-        last_alert_time[market][symbol] = now_ts
 
         # 24h 涨幅 & 成交额
         try:
@@ -438,6 +486,7 @@ def update_and_check_market(market: str, tickers: list):
 
         # 方向
         direction = "📈 涨" if change_pct > 0 else "📉 跌"
+        dir_cn = "上涨" if direction_flag == "UP" else "下跌"
 
         # 更好看的交易对展示
         pretty_symbol = symbol
@@ -449,15 +498,21 @@ def update_and_check_market(market: str, tickers: list):
         text_lines = [
             f"{direction} [{pretty_symbol}] {change_pct * 100:+.2f}% in {WINDOW_MINUTES} min",
             f"${base_price:.4f} → ${last_price:.4f}",
-            f"24h: {chg_24h:+.2f}% | Vol: ${human_readable_number(vol_quote)}",
+            f"24h: {chg_24h:+.2f}% | Vol: ${human_readable_number(vol_quote)} | {dir_cn}第 {alert_count} 次告警",
             f"MC: {mc_str} | FDV: {fdv_str} | OI: {oi_str}",
             f"{WINDOW_MINUTES} min 内 OI 变化: {oi_15m_change}",
             f"1m K线 (Binance): {tradingview_link}",
         ]
         msg = "\n".join(text_lines)
         logging.info("触发告警：%s", msg.replace("\n", " | "))
-        send_telegram_message(msg)
-        send_symbol_1m_chart(symbol,market)
+        # 先尝试生成 1 分钟 K 线图，如果成功就用图片 + caption 发成一条消息
+        chart_bytes = generate_1m_candlestick_png(symbol, market, limit=240)
+        if chart_bytes:
+            # 一条消息里同时包含文字和图片
+            send_telegram_photo(chart_bytes, caption=msg)
+        else:
+            # 如果画图失败，就退回到只发文字
+            send_telegram_message(msg)
 
 
 def startup_message(spot_count: int, um_count: int, cm_count: int):
