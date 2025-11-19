@@ -35,6 +35,9 @@ ALERT_RESET_SECONDS = int(os.getenv("ALERT_RESET_SECONDS", "1800"))
 #                "last_up_ts": float, "last_down_ts": float}
 alert_streak_state = {}
 
+# 新增：每个 (base + 方向) 最后一条告警的 message_id，用来 reply
+# key = f"{base_asset}:UP" / f"{base_asset}:DOWN"
+alert_last_message_id = {}
 
 # 新增：配置需要屏蔽的币种（base asset），默认屏蔽 BTTC
 # 例子：BLACKLIST_BASES=BTTC,PEPE,1000BONK
@@ -45,6 +48,50 @@ BLOCKED_BASES = {b.strip().upper() for b in BLACKLIST_BASES.split(",") if b.stri
 BINANCE_SPOT_BASE = "https://api.binance.com"
 BINANCE_FAPI_BASE = "https://fapi.binance.com"  # U 本位
 BINANCE_DAPI_BASE = "https://dapi.binance.com"  # 币本位
+
+# OI 变化统计窗口（分钟）
+OI_WINDOW_MINUTES = int(os.getenv("OI_WINDOW_MINUTES", "15"))
+
+# 映射分钟 -> Binance period
+OI_PERIOD_MAP = {
+    5: "5m",
+    15: "15m",
+    30: "30m",
+    60: "1h",
+    120: "2h",
+    240: "4h",
+    360: "6h",
+    720: "12h",
+    1440: "1d",
+}
+
+
+def _get_oi_period_and_label(window_minutes: int):
+    """把分钟数映射成 Binance period 和展示用的 label"""
+    if window_minutes in OI_PERIOD_MAP:
+        actual_minutes = window_minutes
+        period = OI_PERIOD_MAP[window_minutes]
+    else:
+        # 不在表里的就找一个最近的
+        closest = min(OI_PERIOD_MAP.keys(), key=lambda k: abs(k - window_minutes))
+        actual_minutes = closest
+        period = OI_PERIOD_MAP[closest]
+
+    if actual_minutes < 60:
+        label = f"{actual_minutes} min"
+    elif actual_minutes == 1440:
+        label = "1 d"
+    elif actual_minutes % 60 == 0:
+        label = f"{actual_minutes // 60} h"
+    else:
+        label = f"{actual_minutes} min"
+
+    return period, label, actual_minutes
+
+
+# 全局：OI_PERIOD 给 Binance API 用，OI_WINDOW_LABEL 用来显示
+OI_PERIOD, OI_WINDOW_LABEL, OI_WINDOW_MINUTES = _get_oi_period_and_label(OI_WINDOW_MINUTES)
+
 
 # 价格历史 & 最后提醒时间
 price_history = {
@@ -69,47 +116,66 @@ logging.basicConfig(
 
 # ================== 工具函数 ==================
 
-def send_telegram_message(text: str) -> None:
-    """发送 Telegram 文本消息"""
+def send_telegram_message(text: str, reply_to_message_id=None):
+    """发送 Telegram 文本消息，返回 message_id 或 None"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("未设置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，无法发送 Telegram。")
-        return
+        return None
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": False,
+    }
+    if reply_to_message_id is not None:
+        data["reply_to_message_id"] = reply_to_message_id
+        data["allow_sending_without_reply"] = True
+
     try:
-        resp = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                # 为了让 TradingView 链接显示预览，这里设为 False
-                "disable_web_page_preview": False,
-            },
-            timeout=10,
-        )
+        resp = requests.post(url, data=data, timeout=10)
         if not resp.ok:
             logging.warning("发送 Telegram 失败: %s", resp.text)
+            return None
+        try:
+            js = resp.json()
+            return js.get("result", {}).get("message_id")
+        except Exception:
+            return None
     except Exception as e:
         logging.exception("发送 Telegram 异常: %s", e)
+        return None
 
-def send_telegram_photo(photo_bytes, caption=None):
-    """发送 Telegram 图片（PNG 二进制）"""
+
+def send_telegram_photo(photo_bytes, caption=None, reply_to_message_id=None):
+    """发送 Telegram 图片（PNG 二进制），返回 message_id 或 None"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("未设置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，无法发送 Telegram 图片。")
-        return
+        return None
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": ("chart.png", photo_bytes)}
     data = {"chat_id": TELEGRAM_CHAT_ID}
     if caption:
         data["caption"] = caption
+    if reply_to_message_id is not None:
+        data["reply_to_message_id"] = reply_to_message_id
+        data["allow_sending_without_reply"] = True
 
     try:
         resp = requests.post(url, data=data, files=files, timeout=20)
         if not resp.ok:
             logging.warning("发送 Telegram 图片失败: %s", resp.text)
+            return None
+        try:
+            js = resp.json()
+            return js.get("result", {}).get("message_id")
+        except Exception:
+            return None
     except Exception as e:
         logging.exception("发送 Telegram 图片异常: %s", e)
+        return None
+
 
 
 def human_readable_number(x):
@@ -194,12 +260,22 @@ def load_coingecko_marketcaps():
 
 
 def get_mc_fdv_from_symbol(binance_symbol: str):
-    """根据 base asset 从 CoinGecko 缓存中拿 MC / FDV"""
+    """
+    返回 (MC 字符串, FDV 字符串, MC 数值, FDV 数值)
+    数值为 None 说明无法获取
+    """
     base = extract_base_asset(binance_symbol)
     info = coingecko_cache.get(base)
     if not info:
-        return "N/A", "N/A"
-    return human_readable_number(info["mc"]), human_readable_number(info["fdv"])
+        return "N/A", "N/A", None, None
+
+    mc = info.get("mc")
+    fdv = info.get("fdv")
+    mc_val = float(mc) if mc is not None else None
+    fdv_val = float(fdv) if fdv is not None else None
+
+    return human_readable_number(mc), human_readable_number(fdv), mc_val, fdv_val
+
 
 
 def build_tradingview_1m_link(binance_symbol: str, market: str) -> str:
@@ -259,43 +335,47 @@ def fetch_futures_24h_tickers(market: str):
     return filtered
 
 
-def fetch_open_interest_and_change_15m(symbol: str, market: str):
+def fetch_open_interest_stats(symbol: str, market: str):
     """
-    获取当前 OI 和大约 15 分钟内 OI 变化百分比（只对合约）
+    获取当前 OI、指定窗口内 OI 变化率，以及当前 OI 的美元价值
+    返回: (oi_str, oi_change_str, oi_value_usd or None)
     """
     try:
         if market == "um":
             base = BINANCE_FAPI_BASE
-            open_interest_url = f"{base}/fapi/v1/openInterest"
-            hist_url = f"{base}/futures/data/openInterestHist"
-        else:
+        else:  # "cm"
             base = BINANCE_DAPI_BASE
-            open_interest_url = f"{base}/dapi/v1/openInterest"
-            hist_url = f"{base}/futures/data/openInterestHist"
 
-        # 当前 OI
-        oi_resp = requests.get(open_interest_url, params={"symbol": symbol}, timeout=10)
-        oi_resp.raise_for_status()
-        current_oi = float(oi_resp.json().get("openInterest", 0.0))
+        hist_url = f"{base}/futures/data/openInterestHist"
 
-        # 最近 4 根 5m 的 OI 历史（大概覆盖 15m+）
-        hist_resp = requests.get(
-            hist_url,
-            params={"symbol": symbol, "period": "5m", "limit": 4},
-            timeout=10,
-        )
+        # 用全局的 OI_PERIOD 与 limit=2，大致覆盖 OI_WINDOW_MINUTES
+        params = {"symbol": symbol, "period": OI_PERIOD, "limit": 2}
+        hist_resp = requests.get(hist_url, params=params, timeout=10)
         hist_resp.raise_for_status()
         hist = hist_resp.json()
-        if len(hist) < 2:
-            return human_readable_number(current_oi), "N/A"
-        old_oi = float(hist[0].get("sumOpenInterest", 0.0))
-        if old_oi <= 0:
-            return human_readable_number(current_oi), "N/A"
-        change_pct = (current_oi - old_oi) / old_oi
-        return human_readable_number(current_oi), f"{change_pct * 100:+.2f}%"
+
+        if not hist:
+            return "N/A", "N/A", None
+
+        latest = hist[-1]
+        current_oi_value = float(latest.get("sumOpenInterestValue", 0.0) or 0.0)
+
+        if len(hist) >= 2:
+            oldest = hist[0]
+            old_oi_value = float(oldest.get("sumOpenInterestValue", 0.0) or 0.0)
+            if old_oi_value > 0:
+                change_pct = (current_oi_value - old_oi_value) / old_oi_value
+                change_str = f"{change_pct * 100:+.2f}%"
+            else:
+                change_str = "N/A"
+        else:
+            change_str = "N/A"
+        oi_display_str = "$" + human_readable_number(current_oi_value)
+        return oi_display_str, change_str, current_oi_value
     except Exception as e:
         logging.warning("获取 %s OI 数据失败: %s", symbol, e)
-        return "N/A", "N/A"
+        return "N/A", "N/A", None
+
 
 # fetch 1m k chart line
 def fetch_1m_klines(symbol: str, market: str, limit: int = 240):
@@ -374,9 +454,10 @@ def generate_1m_candlestick_png(symbol: str, market: str, limit: int = 120):
         logging.warning("生成 %s 1m K 线图失败: %s", symbol, e)
         return None
 
-def update_alert_streak(base_asset: str, direction_flag: str, now_ts: float) -> int:
+def update_alert_streak(base_asset: str, direction_flag: str, now_ts: float):
     """
-    更新某个 base 币种在某个方向上的告警次数，并返回当前是第几次告警。
+    更新某个 base 币种在某个方向上的告警次数，并返回：
+    (当前是第几次告警, 上一次同方向告警距今多少分钟 or None)
     direction_flag: "UP" 或 "DOWN"
     """
     state = alert_streak_state.get(base_asset, {
@@ -388,27 +469,40 @@ def update_alert_streak(base_asset: str, direction_flag: str, now_ts: float) -> 
     })
 
     if direction_flag == "UP":
-        last_ts = state.get("last_up_ts", 0.0)
-        # 方向改变 或 距离上次上涨告警超过 ALERT_RESET_SECONDS -> 重置为第一次
-        if state.get("last_dir") != "UP" or now_ts - last_ts > ALERT_RESET_SECONDS:
+        prev_ts = state.get("last_up_ts", 0.0) or 0.0
+        minutes_since_prev = None
+        if prev_ts > 0:
+            minutes_since_prev = (now_ts - prev_ts) / 60.0
+
+        # 方向切换 或 间隔超过 ALERT_RESET_SECONDS -> 重置次数为 1
+        reset_needed = (state.get("last_dir") != "UP") or (prev_ts == 0.0) or (now_ts - prev_ts > ALERT_RESET_SECONDS)
+        if reset_needed:
             state["up_count"] = 1
         else:
             state["up_count"] = state.get("up_count", 0) + 1
+
         state["last_up_ts"] = now_ts
         state["last_dir"] = "UP"
         count = state["up_count"]
     else:  # DOWN
-        last_ts = state.get("last_down_ts", 0.0)
-        if state.get("last_dir") != "DOWN" or now_ts - last_ts > ALERT_RESET_SECONDS:
+        prev_ts = state.get("last_down_ts", 0.0) or 0.0
+        minutes_since_prev = None
+        if prev_ts > 0:
+            minutes_since_prev = (now_ts - prev_ts) / 60.0
+
+        reset_needed = (state.get("last_dir") != "DOWN") or (prev_ts == 0.0) or (now_ts - prev_ts > ALERT_RESET_SECONDS)
+        if reset_needed:
             state["down_count"] = 1
         else:
             state["down_count"] = state.get("down_count", 0) + 1
+
         state["last_down_ts"] = now_ts
         state["last_dir"] = "DOWN"
         count = state["down_count"]
 
     alert_streak_state[base_asset] = state
-    return count
+    return count, minutes_since_prev
+
 
 
 # ================== 监控 & 告警逻辑 ==================
@@ -454,19 +548,16 @@ def update_and_check_market(market: str, tickers: list):
         if abs(change_pct) < PRICE_CHANGE_THRESHOLD:
             continue
 
-        # ========= 新增：同一个「币种 + 方向」在全局至少间隔 ALERT_MIN_INTERVAL_SECONDS 秒 =========
+        # 同一个「base 币种 + 方向」在全局至少间隔 ALERT_MIN_INTERVAL_SECONDS 秒
         direction_flag = "UP" if change_pct > 0 else "DOWN"
-        # 这里用 base_asset 去重，这样现货 / U 本位 / 币本位不会重复轰炸
         alert_key = f"{base_asset}:{direction_flag}"
         last_ts_key = last_alert_key_time.get(alert_key, 0)
         if now_ts - last_ts_key < ALERT_MIN_INTERVAL_SECONDS:
-            # 同一币种 + 同一方向，时间间隔太短，直接跳过
             continue
         last_alert_key_time[alert_key] = now_ts
-        # =========================================================================
-        # 计算这是该币种在该方向上的第几次告警（带 30min 自动重置 & 方向切换重置）
-        alert_count = update_alert_streak(base_asset, direction_flag, now_ts)
 
+        # 计算「第几次告警」以及上一次同方向告警的时间
+        alert_count, minutes_since_prev = update_alert_streak(base_asset, direction_flag, now_ts)
 
         # 24h 涨幅 & 成交额
         try:
@@ -475,20 +566,35 @@ def update_and_check_market(market: str, tickers: list):
             chg_24h = 0.0
         vol_quote = item.get("quoteVolume") or item.get("volume") or "0"
 
-        # MC / FDV
-        mc_str, fdv_str = get_mc_fdv_from_symbol(symbol)
+        # MC / FDV（带原始数值）
+        mc_str, fdv_str, mc_raw, fdv_raw = get_mc_fdv_from_symbol(symbol)
 
-        # OI & 15min OI 变化（只对合约市场有）
+        # OI 及 OI 变化（只对合约有）
         if market in ("um", "cm"):
-            oi_str, oi_15m_change = fetch_open_interest_and_change_15m(symbol, market)
+            oi_str, oi_change_str, oi_value_usd = fetch_open_interest_stats(symbol, market)
         else:
-            oi_str, oi_15m_change = "N/A", "N/A"
+            oi_str, oi_change_str, oi_value_usd = "N/A", "N/A", None
 
-        # 方向
+        # OI / 市值 比率
+        oi_mc_ratio_str = "N/A"
+        if oi_value_usd is not None and oi_value_usd > 0 and mc_raw is not None and mc_raw > 0:
+            try:
+                ratio = oi_value_usd / mc_raw
+                oi_mc_ratio_str = f"{ratio * 100:.2f}%"
+            except Exception:
+                oi_mc_ratio_str = "N/A"
+
+        # 方向 & 中文文案
         direction = "📈 涨" if change_pct > 0 else "📉 跌"
         dir_cn = "上涨" if direction_flag == "UP" else "下跌"
 
-        # 更好看的交易对展示
+        # 上一次同方向告警时间
+        if minutes_since_prev is None:
+            last_alert_text = "上一次同方向告警: 首次告警"
+        else:
+            last_alert_text = f"上一次同方向告警: {minutes_since_prev:.1f} 分钟前"
+
+        # 更好看的 symbol 展示
         pretty_symbol = symbol
         if symbol.endswith("USDT"):
             pretty_symbol = symbol.replace("USDT", "/USDT")
@@ -496,23 +602,31 @@ def update_and_check_market(market: str, tickers: list):
         tradingview_link = build_tradingview_1m_link(symbol, market)
 
         text_lines = [
-            f"{direction} [{pretty_symbol}] {change_pct * 100:+.2f}% in {WINDOW_MINUTES} min",
+            f"{direction} [{pretty_symbol}] {change_pct * 100:+.2f}% in {WINDOW_MINUTES} min | {dir_cn}第 {alert_count} 次告警",
             f"${base_price:.4f} → ${last_price:.4f}",
-            f"24h: {chg_24h:+.2f}% | Vol: ${human_readable_number(vol_quote)} | {dir_cn}第 {alert_count} 次告警",
-            f"MC: {mc_str} | FDV: {fdv_str} | OI: {oi_str}",
-            f"{WINDOW_MINUTES} min 内 OI 变化: {oi_15m_change}",
-            f"1m K线 (Binance): {tradingview_link}",
+            f"24h: {chg_24h:+.2f}% | Vol: ${human_readable_number(vol_quote)}",
+            f"MC: {mc_str} | FDV: {fdv_str} | OI: {oi_str} | OI/MC: {oi_mc_ratio_str}",
+            f"{OI_WINDOW_LABEL} 内 OI 变化: {oi_change_str}",
+            last_alert_text,
+            f"1m K线 (TradingView): {tradingview_link}",
         ]
+
         msg = "\n".join(text_lines)
         logging.info("触发告警：%s", msg.replace("\n", " | "))
-        # 先尝试生成 1 分钟 K 线图，如果成功就用图片 + caption 发成一条消息
+
+        # 如果是同一方向的连续告警，则回复上一条同方向消息
+        prev_msg_id = alert_last_message_id.get(alert_key)
+        reply_to_id = prev_msg_id if (alert_count > 1 and prev_msg_id is not None) else None
+
         chart_bytes = generate_1m_candlestick_png(symbol, market, limit=240)
         if chart_bytes:
-            # 一条消息里同时包含文字和图片
-            send_telegram_photo(chart_bytes, caption=msg)
+            message_id = send_telegram_photo(chart_bytes, caption=msg, reply_to_message_id=reply_to_id)
         else:
-            # 如果画图失败，就退回到只发文字
-            send_telegram_message(msg)
+            message_id = send_telegram_message(msg, reply_to_message_id=reply_to_id)
+
+        # 记录本次消息 id，供后续 reply 使用
+        if message_id is not None:
+            alert_last_message_id[alert_key] = message_id
 
 
 def startup_message(spot_count: int, um_count: int, cm_count: int):
