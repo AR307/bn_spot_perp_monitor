@@ -93,20 +93,20 @@ def _get_oi_period_and_label(window_minutes: int):
 OI_PERIOD, OI_WINDOW_LABEL, OI_WINDOW_MINUTES = _get_oi_period_and_label(OI_WINDOW_MINUTES)
 
 
-# 价格历史 & 最后提醒时间
+# 价格历史 & 最后提醒时间（只保留 U 本位合约）
 price_history = {
-    "spot": defaultdict(lambda: deque()),
     "um": defaultdict(lambda: deque()),
-    "cm": defaultdict(lambda: deque()),
 }
 last_alert_time = {
-    "spot": {},
     "um": {},
-    "cm": {},
 }
 
 # CoinGecko 市值缓存：symbol -> {mc, fdv}
 coingecko_cache = {}
+# CoinGecko 最后更新时间（用于定期刷新）
+last_coingecko_update = 0
+# CoinGecko 刷新间隔（秒），默认 6 小时
+COINGECKO_REFRESH_INTERVAL = int(os.getenv("COINGECKO_REFRESH_INTERVAL", "21600"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -219,7 +219,7 @@ def extract_base_asset(binance_symbol: str) -> str:
 
 def load_coingecko_marketcaps():
     """从 CoinGecko 拉一份 symbol -> (mc, fdv) 映射"""
-    global coingecko_cache
+    global coingecko_cache, last_coingecko_update
     logging.info("从 CoinGecko 拉取市场数据（用于 MC / FDV）...")
     cache = {}
     page = 1
@@ -237,7 +237,7 @@ def load_coingecko_marketcaps():
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logging.warning("获取 CoinGecko 数据失败: %s", e)
+            logging.warning("获取 CoinGecko 数据失败 (page %d): %s", page, e)
             break
 
         if not data:
@@ -256,6 +256,7 @@ def load_coingecko_marketcaps():
             break
 
     coingecko_cache = cache
+    last_coingecko_update = time.time()
     logging.info("CoinGecko 市值缓存完成，共 %d 个 symbol", len(coingecko_cache))
 
 
@@ -335,7 +336,7 @@ def fetch_futures_24h_tickers(market: str):
     return filtered
 
 
-def fetch_open_interest_stats(symbol: str, market: str):
+def fetch_open_interest_stats(symbol: str, market: str, retry=True):
     """
     获取当前 OI、指定窗口内 OI 变化率，以及当前 OI 的美元价值
     返回: (oi_str, oi_change_str, oi_value_usd or None)
@@ -355,6 +356,7 @@ def fetch_open_interest_stats(symbol: str, market: str):
         hist = hist_resp.json()
 
         if not hist:
+            logging.warning("获取 %s OI 数据返回空列表", symbol)
             return "N/A", "N/A", None
 
         latest = hist[-1]
@@ -373,7 +375,12 @@ def fetch_open_interest_stats(symbol: str, market: str):
         oi_display_str = "$" + human_readable_number(current_oi_value)
         return oi_display_str, change_str, current_oi_value
     except Exception as e:
-        logging.warning("获取 %s OI 数据失败: %s", symbol, e)
+        logging.warning("获取 %s OI 数据失败: %s (market: %s, period: %s)", symbol, e, market, OI_PERIOD)
+        # 重试一次
+        if retry:
+            logging.info("重试获取 %s OI 数据...", symbol)
+            time.sleep(0.5)
+            return fetch_open_interest_stats(symbol, market, retry=False)
         return "N/A", "N/A", None
 
 
@@ -629,16 +636,16 @@ def update_and_check_market(market: str, tickers: list):
             alert_last_message_id[alert_key] = message_id
 
 
-def startup_message(spot_count: int, um_count: int, cm_count: int):
+def startup_message(um_count: int):
     """启动成功提示（推送到 TG）"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     text = (
-        "✅ 运行成功！\n"
+        "✅ 监控系统运行成功！\n"
         f"当前时间: {now_str}\n"
-        f"检测到 现货交易对: {spot_count} 个\n"
-        f"U本位合约: {um_count} 个\n"
-        f"币本位合约: {cm_count} 个\n"
-        f"屏蔽币种(按 base asset): {', '.join(sorted(BLOCKED_BASES)) if BLOCKED_BASES else '无'}"
+        f"监控模式: 仅 U 本位合约\n"
+        f"检测到 U 本位合约: {um_count} 个\n"
+        f"屏蔽币种(按 base asset): {', '.join(sorted(BLOCKED_BASES)) if BLOCKED_BASES else '无'}\n"
+        f"CoinGecko 缓存: {len(coingecko_cache)} 个 symbol"
     )
     logging.info(text.replace("\n", " | "))
     send_telegram_message(text)
@@ -653,48 +660,80 @@ def main():
 
     load_coingecko_marketcaps()
 
-    # 先拉一次数据，统计数量并发“运行成功”提示
-    spot_tickers = fetch_spot_24h_tickers()
-    um_tickers = fetch_futures_24h_tickers("um")
-    cm_tickers = fetch_futures_24h_tickers("cm")
+    # 先拉一次数据，统计数量并发"运行成功"提示
 
-    startup_message(len(spot_tickers), len(um_tickers), len(cm_tickers))
+    um_tickers = fetch_futures_24h_tickers("um")
+
+
+
+    startup_message(len(um_tickers))
+
+
 
     # 初始填充历史价格（让 15min 统计尽快生效）
-    update_and_check_market("spot", spot_tickers)
+
     update_and_check_market("um", um_tickers)
-    update_and_check_market("cm", cm_tickers)
+
+
 
     logging.info(
-        "开始循环监控：窗口=%d 分钟，波动阈值=%.2f%%，循环间隔=%d 秒",
+
+        "开始循环监控：仅 U 本位合约，窗口=%d 分钟，波动阈值=%.2f%%，循环间隔=%d 秒",
+
         WINDOW_MINUTES,
+
         PRICE_CHANGE_THRESHOLD * 100,
+
         CHECK_INTERVAL_SECONDS,
+
     )
 
+
+
     while True:
+
         loop_start = time.time()
-        try:
-            spot_tickers = fetch_spot_24h_tickers()
-            update_and_check_market("spot", spot_tickers)
-        except Exception as e:
-            logging.warning("拉取现货数据失败: %s", e)
+
+        
+
+        # 定期刷新 CoinGecko 缓存
+
+        if time.time() - last_coingecko_update > COINGECKO_REFRESH_INTERVAL:
+
+            logging.info("CoinGecko 缓存已超过 %d 秒，开始刷新...", COINGECKO_REFRESH_INTERVAL)
+
+            try:
+
+                load_coingecko_marketcaps()
+
+                logging.info("CoinGecko 市值缓存刷新完成")
+
+            except Exception as e:
+
+                logging.warning("刷新 CoinGecko 缓存失败: %s", e)
+
+
+
+        # 只监控 U 本位合约
 
         try:
+
             um_tickers = fetch_futures_24h_tickers("um")
+
             update_and_check_market("um", um_tickers)
+
         except Exception as e:
+
             logging.warning("拉取 U 本位合约数据失败: %s", e)
 
-        try:
-            cm_tickers = fetch_futures_24h_tickers("cm")
-            update_and_check_market("cm", cm_tickers)
-        except Exception as e:
-            logging.warning("拉取 币本位合约数据失败: %s", e)
+
 
         elapsed = time.time() - loop_start
+
         sleep_time = max(5, CHECK_INTERVAL_SECONDS - elapsed)
+
         time.sleep(sleep_time)
+
 
 
 if __name__ == "__main__":
